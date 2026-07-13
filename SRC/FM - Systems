@@ -1,0 +1,759 @@
+Python dependencies.
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+email-validator==2.2.0
+pydantic-settings==2.5.2
+openai==1.51.0
+python-dotenv==1.0.1
+ 
+.env.example
+Environment variable template (OpenAI key, model, app env).
+# OpenAI credentials
+OPENAI_API_KEY=sk-your-key-here
+OPENAI_MODEL=gpt-4o-mini
+ 
+# App
+APP_ENV=development
+ 
+app/config.py
+Centralized application configuration, loaded from environment variables.
+"""
+Centralized application configuration.
+ 
+Reads from environment variables / a local .env file so no secrets
+ever live in source code.
+"""
+from functools import lru_cache
+ 
+from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
+ 
+class Settings(BaseSettings):
+    app_env: str = "development"
+ 
+    # OpenAI
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
+    openai_request_timeout: float = 30.0
+ 
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+ 
+ 
+@lru_cache
+def get_settings() -> Settings:
+    """Return a cached Settings instance (loaded once per process)."""
+    return Settings()
+ 
+app/llm/client.py
+Single wrapper around the OpenAI SDK — every LLM call in the app goes through this module.
+"""
+Thin wrapper around the OpenAI SDK.
+ 
+Every LLM call in the app goes through this module so that:
+- error handling / retries / timeouts live in one place
+- the rest of the codebase depends on a simple interface, not the SDK directly
+- swapping models or providers later only touches this file
+"""
+from __future__ import annotations
+ 
+import logging
+ 
+from openai import OpenAI, OpenAIError
+ 
+from app.config import get_settings
+ 
+logger = logging.getLogger(__name__)
+ 
+ 
+class LLMUnavailableError(RuntimeError):
+    """Raised when the LLM provider cannot fulfill a request."""
+ 
+ 
+class OpenAIClient:
+    """Small convenience layer over the OpenAI Chat Completions API."""
+ 
+    def __init__(self) -> None:
+        settings = get_settings()
+        if not settings.openai_api_key:
+            logger.warning("OPENAI_API_KEY is not set; LLM features will fail until configured.")
+        self._client = OpenAI(api_key=settings.openai_api_key, timeout=settings.openai_request_timeout)
+        self._model = settings.openai_model
+ 
+    def complete(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        temperature: float = 0.4,
+        max_tokens: int = 500,
+    ) -> str:
+        """Send a single-turn chat completion request and return the text response."""
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except OpenAIError as exc:
+            logger.error("OpenAI request failed: %s", exc)
+            raise LLMUnavailableError(str(exc)) from exc
+ 
+        content = response.choices[0].message.content
+        if not content:
+            raise LLMUnavailableError("OpenAI returned an empty response.")
+        return content.strip()
+ 
+ 
+def get_llm_client() -> OpenAIClient:
+    """Factory used as a FastAPI dependency."""
+    return OpenAIClient()
+ 
+app/models/schemas.py
+Pydantic request/response models for every section of the page.
+"""
+Pydantic models shared across the API.
+ 
+Grouped by the page section they represent, in the same order they
+appear on https://fmsystems.com/solutions/
+"""
+from __future__ import annotations
+ 
+from enum import Enum
+from typing import Optional
+ 
+from pydantic import BaseModel, EmailStr, Field
+ 
+ 
+# ---------------------------------------------------------------------------
+# Section: "Solutions to benefit every role"
+# ---------------------------------------------------------------------------
+class PersonaKey(str, Enum):
+    employees = "employees"
+    facilities = "facilities"
+    executives = "executives"
+ 
+ 
+class SolutionPersona(BaseModel):
+    key: PersonaKey
+    audience: str
+    headline: str
+    description: str
+    capabilities: list[str]
+    learn_more_url: str
+ 
+ 
+# ---------------------------------------------------------------------------
+# Section: "Featured Resources"
+# ---------------------------------------------------------------------------
+class ResourceType(str, Enum):
+    webinar = "Webinar"
+    ebook = "E-Book"
+    blog = "Blog"
+ 
+ 
+class Resource(BaseModel):
+    title: str
+    resource_type: ResourceType
+    description: str
+    url: str
+ 
+ 
+class ResourceSummaryResponse(BaseModel):
+    title: str
+    ai_teaser: str = Field(..., description="LLM-generated one-line teaser for the resource")
+ 
+ 
+# ---------------------------------------------------------------------------
+# Section: "Hybrid Workplace Planning Calculator"
+# ---------------------------------------------------------------------------
+class CalculatorInput(BaseModel):
+    current_employee_count: int = Field(..., gt=0)
+    avg_days_in_office_per_week: float = Field(..., ge=0, le=5)
+    current_desk_count: int = Field(..., ge=0)
+    square_feet_per_desk: float = Field(120.0, gt=0)
+    annual_cost_per_square_foot: float = Field(35.0, gt=0)
+    desk_sharing_ratio: float = Field(
+        1.5, gt=0, description="Employees per desk under a hybrid/hot-desking model"
+    )
+ 
+ 
+class CalculatorResult(BaseModel):
+    recommended_desk_count: int
+    current_square_footage: float
+    recommended_square_footage: float
+    square_footage_reduction: float
+    estimated_annual_savings: float
+    ai_narrative: Optional[str] = Field(
+        None, description="LLM-generated plain-English explanation of the results"
+    )
+ 
+ 
+# ---------------------------------------------------------------------------
+# "Get started today" / footer contact form
+# ---------------------------------------------------------------------------
+class LeadRequest(BaseModel):
+    full_name: str
+    email: EmailStr
+    company: str
+    job_title: Optional[str] = None
+    persona: Optional[PersonaKey] = None
+    message: Optional[str] = Field(None, description="Free-text note from the prospect")
+ 
+ 
+class LeadResponse(BaseModel):
+    lead_id: str
+    status: str
+    ai_followup_email: Optional[str] = Field(
+        None, description="LLM-drafted personalized follow-up email for sales to review"
+    )
+ 
+ 
+# ---------------------------------------------------------------------------
+# Cross-section: solution recommender ("Solutions to benefit every role")
+# ---------------------------------------------------------------------------
+class RecommendationRequest(BaseModel):
+    role_description: str = Field(
+        ..., min_length=10, description="Free text describing the user's role and challenges"
+    )
+ 
+ 
+class RecommendationResponse(BaseModel):
+    recommended_persona: PersonaKey
+    rationale: str
+    suggested_capabilities: list[str]
+ 
+app/data/seed_data.py
+Static content mirrored from the Solutions page (personas, resources).
+"""
+Static content mirrored from the "Solutions" page sections.
+ 
+Kept as plain data (not hardcoded in routers/services) so it can later be
+swapped for a database or CMS query without touching business logic.
+"""
+from app.models.schemas import PersonaKey, Resource, ResourceType, SolutionPersona
+ 
+SOLUTION_PERSONAS: dict[PersonaKey, SolutionPersona] = {
+    PersonaKey.employees: SolutionPersona(
+        key=PersonaKey.employees,
+        audience="Employees + Occupants",
+        headline="Healthy, Hybrid Workplaces",
+        description=(
+            "FM:Systems empowers employees to have ideal workplace experiences, "
+            "providing the tools they need to easily find a workspace, host "
+            "productive meetings, and connect and collaborate with one another."
+        ),
+        capabilities=[
+            "Interactive Floor Plans",
+            "Digital Signage",
+            "Room and Desk Booking",
+            "Workplace Services",
+            "Mobile Scheduling",
+            "Visitor Management",
+        ],
+        learn_more_url="https://fmsystems.com/access/",
+    ),
+    PersonaKey.facilities: SolutionPersona(
+        key=PersonaKey.facilities,
+        audience="Facilities + Real Estate",
+        headline="Smart, Streamlined Operations",
+        description=(
+            "Centralized space and asset data allows facility and real estate "
+            "teams to control maintenance programs, enhance efficiency, enable "
+            "predictive and prescriptive operations, identify areas of "
+            "underutilization, and optimize space allocation."
+        ),
+        capabilities=[
+            "Space Management",
+            "Digital Floor Plans",
+            "Scenario Planning",
+            "Automated Facility Management",
+            "Work Order Ticketing",
+            "Environmental Monitoring",
+        ],
+        learn_more_url="https://fmsystems.com/manage/",
+    ),
+    PersonaKey.executives: SolutionPersona(
+        key=PersonaKey.executives,
+        audience="Real Estate Executives",
+        headline="Optimized Portfolios",
+        description=(
+            "FM:Systems provides the objective intelligence necessary to "
+            "refocus and rationalize portfolios: visualize building "
+            "utilization and performance, access multiple data sets in "
+            "aggregate, and make informed, strategic decisions to reduce "
+            "costs, restack portfolios, and optimize performance."
+        ),
+        capabilities=[
+            "Utilization Sensors",
+            "Environmental Sensors",
+            "Booking Analytics",
+            "Performance Scoring",
+            "Predictive Modeling",
+            "AI Narratives",
+        ],
+        learn_more_url="https://fmsystems.com/measure/",
+    ),
+}
+ 
+FEATURED_RESOURCES: list[Resource] = [
+    Resource(
+        title="Design for Belonging – Create Workspaces that Work for Everyone",
+        resource_type=ResourceType.webinar,
+        description=(
+            "Learn how IWMS identifies experience gaps, supports accessibility "
+            "goals, and enables continuous improvement with real-time feedback "
+            "and utilization analytics."
+        ),
+        url="https://fmsystems.com/resource/webinars/create-workspaces-that-work-for-everyone/",
+    ),
+    Resource(
+        title="Celebrating World FM Day: Strategies for the Future of the Workplace",
+        resource_type=ResourceType.webinar,
+        description=(
+            "Join industry leaders for a dynamic World FM Day webinar exploring "
+            "forward-thinking strategies to shape the future of the workplace."
+        ),
+        url="https://fmsystems.com/resource/webinars/celebrating-world-fm-day-strategies-for-the-future-of-the-workplace-2/",
+    ),
+    Resource(
+        title="Workplace Strategy as a Service: Rethinking How Organizations Plan for Change",
+        resource_type=ResourceType.webinar,
+        description=(
+            "Learn how agile, data-driven workplace strategies like WSaaS help "
+            "organizations adapt to evolving workforce needs and space "
+            "utilization trends."
+        ),
+        url="https://fmsystems.com/resource/webinars/workplace-strategy-as-a-service-rethinking-how-organizations-plan-for-change/",
+    ),
+]
+ 
+app/services/solutions_service.py
+Business logic for the 'Solutions to benefit every role' section.
+"""Business logic for the 'Solutions to benefit every role' section."""
+from app.data.seed_data import SOLUTION_PERSONAS
+from app.models.schemas import PersonaKey, SolutionPersona
+ 
+ 
+def list_personas() -> list[SolutionPersona]:
+    """Return all three solution personas, in page order."""
+    return list(SOLUTION_PERSONAS.values())
+ 
+ 
+def get_persona(key: PersonaKey) -> SolutionPersona:
+    """Return a single persona by key. Raises KeyError if not found."""
+    return SOLUTION_PERSONAS[key]
+ 
+app/services/resources_service.py
+Business logic for the 'Featured Resources' section, incl. AI teaser generation.
+"""Business logic for the 'Featured Resources' section."""
+from app.data.seed_data import FEATURED_RESOURCES
+from app.llm.client import OpenAIClient
+from app.models.schemas import Resource, ResourceSummaryResponse
+ 
+_TEASER_SYSTEM_PROMPT = (
+    "You are a marketing copywriter for a facilities and workplace management "
+    "software company. Write a single punchy sentence (max 20 words) that "
+    "teases the value of a resource, to entice a facilities or real estate "
+    "professional to click on it. Do not use quotation marks."
+)
+ 
+ 
+def list_resources() -> list[Resource]:
+    """Return the featured resources shown on the page."""
+    return FEATURED_RESOURCES
+ 
+ 
+def find_resource(title: str) -> Resource | None:
+    """Look up a featured resource by exact title."""
+    return next((r for r in FEATURED_RESOURCES if r.title == title), None)
+ 
+ 
+def generate_ai_teaser(resource: Resource, llm: OpenAIClient) -> ResourceSummaryResponse:
+    """Use the LLM to produce a short, punchy teaser line for a resource."""
+    user_prompt = (
+        f"Resource type: {resource.resource_type.value}\n"
+        f"Title: {resource.title}\n"
+        f"Description: {resource.description}"
+    )
+    teaser = llm.complete(_TEASER_SYSTEM_PROMPT, user_prompt, temperature=0.7, max_tokens=60)
+    return ResourceSummaryResponse(title=resource.title, ai_teaser=teaser)
+ 
+app/services/calculator_service.py
+Business logic for the 'Hybrid Workplace Planning Calculator', incl. AI narrative.
+"""
+Business logic for the 'Hybrid Workplace Planning Calculator' section.
+ 
+Numeric estimates are computed deterministically; the LLM is only used
+afterward to translate the numbers into a short, human-readable narrative
+(mirroring the 'AI Narratives' and 'Predictive Modeling' capabilities the
+page lists under the Executives persona).
+"""
+import math
+ 
+from app.llm.client import OpenAIClient
+from app.models.schemas import CalculatorInput, CalculatorResult
+ 
+_NARRATIVE_SYSTEM_PROMPT = (
+    "You are a real estate portfolio analyst. Given workplace utilization "
+    "metrics, write a concise, 3-4 sentence executive narrative explaining "
+    "what the numbers mean and one concrete recommendation. Avoid jargon and "
+    "do not repeat the raw numbers verbatim; interpret them."
+)
+ 
+ 
+def estimate(payload: CalculatorInput) -> CalculatorResult:
+    """Compute recommended desk counts, square footage, and savings."""
+    peak_daily_attendance = payload.current_employee_count * (
+        payload.avg_days_in_office_per_week / 5
+    )
+    recommended_desk_count = max(1, math.ceil(peak_daily_attendance / payload.desk_sharing_ratio))
+ 
+    current_square_footage = payload.current_desk_count * payload.square_feet_per_desk
+    recommended_square_footage = recommended_desk_count * payload.square_feet_per_desk
+    square_footage_reduction = max(0.0, current_square_footage - recommended_square_footage)
+ 
+    estimated_annual_savings = square_footage_reduction * payload.annual_cost_per_square_foot
+ 
+    return CalculatorResult(
+        recommended_desk_count=recommended_desk_count,
+        current_square_footage=round(current_square_footage, 2),
+        recommended_square_footage=round(recommended_square_footage, 2),
+        square_footage_reduction=round(square_footage_reduction, 2),
+        estimated_annual_savings=round(estimated_annual_savings, 2),
+    )
+ 
+ 
+def estimate_with_narrative(payload: CalculatorInput, llm: OpenAIClient) -> CalculatorResult:
+    """Run the numeric estimate, then attach an LLM-generated narrative."""
+    result = estimate(payload)
+ 
+    user_prompt = (
+        f"Employees: {payload.current_employee_count}\n"
+        f"Average in-office days/week: {payload.avg_days_in_office_per_week}\n"
+        f"Current desks: {payload.current_desk_count}\n"
+        f"Recommended desks: {result.recommended_desk_count}\n"
+        f"Current square footage: {result.current_square_footage}\n"
+        f"Recommended square footage: {result.recommended_square_footage}\n"
+        f"Square footage reduction: {result.square_footage_reduction}\n"
+        f"Estimated annual savings (USD): {result.estimated_annual_savings}"
+    )
+    result.ai_narrative = llm.complete(
+        _NARRATIVE_SYSTEM_PROMPT, user_prompt, temperature=0.4, max_tokens=200
+    )
+    return result
+ 
+app/services/leads_service.py
+Business logic for the 'Get started today' / demo request form, incl. AI follow-up email.
+"""
+Business logic for the 'Get started today' / 'Schedule a Demo' contact form.
+ 
+Leads are stored in memory here for demonstration purposes; in production
+this would write to a CRM (e.g. Salesforce, HubSpot) instead.
+"""
+import uuid
+from typing import Optional
+ 
+from app.data.seed_data import SOLUTION_PERSONAS
+from app.llm.client import OpenAIClient
+from app.models.schemas import LeadRequest, LeadResponse, PersonaKey
+ 
+_FOLLOWUP_SYSTEM_PROMPT = (
+    "You are a friendly, professional sales development representative for "
+    "FM:Systems, a workplace and facilities management software company. "
+    "Draft a short follow-up email (under 120 words) to a new inbound lead, "
+    "referencing their stated interest and role where relevant. Sign off as "
+    "'The FM:Systems Team'. Do not invent specific pricing or dates."
+)
+ 
+# In-memory store; swap for a real database/CRM integration in production.
+_LEADS: dict[str, LeadRequest] = {}
+ 
+ 
+def _persona_context(persona: Optional[PersonaKey]) -> str:
+    if persona is None:
+        return "No specific persona was selected."
+    info = SOLUTION_PERSONAS[persona]
+    return f"They are interested in the '{info.audience}' solution: {info.headline}."
+ 
+ 
+def create_lead(payload: LeadRequest, llm: OpenAIClient) -> LeadResponse:
+    """Persist a new lead and draft a personalized follow-up email via LLM."""
+    lead_id = str(uuid.uuid4())
+    _LEADS[lead_id] = payload
+ 
+    user_prompt = (
+        f"Name: {payload.full_name}\n"
+        f"Company: {payload.company}\n"
+        f"Job title: {payload.job_title or 'Unknown'}\n"
+        f"{_persona_context(payload.persona)}\n"
+        f"Message from lead: {payload.message or 'No additional message provided.'}"
+    )
+    followup_email = llm.complete(
+        _FOLLOWUP_SYSTEM_PROMPT, user_prompt, temperature=0.5, max_tokens=250
+    )
+ 
+    return LeadResponse(lead_id=lead_id, status="received", ai_followup_email=followup_email)
+ 
+ 
+def get_lead(lead_id: str) -> Optional[LeadRequest]:
+    """Retrieve a stored lead by id."""
+    return _LEADS.get(lead_id)
+ 
+app/services/recommender_service.py
+LLM-powered persona recommender with a deterministic keyword fallback.
+"""
+LLM-powered persona recommender.
+ 
+Maps a free-text description of a visitor's role/challenges to one of the
+three 'Solutions to benefit every role' personas, using structured JSON
+output so the response can be parsed reliably.
+"""
+import json
+import logging
+ 
+from app.data.seed_data import SOLUTION_PERSONAS
+from app.llm.client import LLMUnavailableError, OpenAIClient
+from app.models.schemas import PersonaKey, RecommendationRequest, RecommendationResponse
+ 
+logger = logging.getLogger(__name__)
+ 
+_SYSTEM_PROMPT = (
+    "You classify a website visitor's free-text description of their job and "
+    "challenges into exactly one of these three personas: "
+    "'employees' (day-to-day workplace experience, desks, rooms, visitors), "
+    "'facilities' (space/asset/maintenance operations for facility or real "
+    "estate teams), or 'executives' (portfolio strategy, cost, utilization "
+    "analytics for leadership). "
+    "Respond with ONLY a JSON object of the form "
+    '{"persona": "<employees|facilities|executives>", "rationale": "<one sentence>"}. '
+    "No markdown, no extra text."
+)
+ 
+ 
+def recommend_persona(request: RecommendationRequest, llm: OpenAIClient) -> RecommendationResponse:
+    """Ask the LLM to classify the request into a persona, with a graceful fallback."""
+    raw_response = llm.complete(
+        _SYSTEM_PROMPT, request.role_description, temperature=0.0, max_tokens=150
+    )
+ 
+    try:
+        parsed = json.loads(raw_response)
+        persona_key = PersonaKey(parsed["persona"])
+        rationale = str(parsed["rationale"])
+    except (json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.warning("Could not parse LLM recommendation response (%s); using fallback.", exc)
+        persona_key = _keyword_fallback(request.role_description)
+        rationale = "Recommended based on keyword matching (LLM response was unparseable)."
+ 
+    persona = SOLUTION_PERSONAS[persona_key]
+    return RecommendationResponse(
+        recommended_persona=persona_key,
+        rationale=rationale,
+        suggested_capabilities=persona.capabilities,
+    )
+ 
+ 
+def _keyword_fallback(text: str) -> PersonaKey:
+    """Simple deterministic fallback if the LLM is unavailable or returns bad JSON."""
+    lowered = text.lower()
+    if any(word in lowered for word in ("portfolio", "cost", "executive", "strategy", "cfo")):
+        return PersonaKey.executives
+    if any(word in lowered for word in ("maintenance", "asset", "space", "facility", "operations")):
+        return PersonaKey.facilities
+    return PersonaKey.employees
+ 
+ 
+def recommend_persona_safe(request: RecommendationRequest, llm: OpenAIClient) -> RecommendationResponse:
+    """Wrapper that falls back to keyword matching if the LLM call itself fails."""
+    try:
+        return recommend_persona(request, llm)
+    except LLMUnavailableError:
+        persona_key = _keyword_fallback(request.role_description)
+        persona = SOLUTION_PERSONAS[persona_key]
+        return RecommendationResponse(
+            recommended_persona=persona_key,
+            rationale="Recommended based on keyword matching (LLM temporarily unavailable).",
+            suggested_capabilities=persona.capabilities,
+        )
+ 
+app/routers/solutions.py
+HTTP routes for the Solutions section.
+"""Routes for the 'Solutions to benefit every role' section."""
+from fastapi import APIRouter, HTTPException
+ 
+from app.models.schemas import PersonaKey, SolutionPersona
+from app.services import solutions_service
+ 
+router = APIRouter(prefix="/solutions", tags=["Solutions"])
+ 
+ 
+@router.get("", response_model=list[SolutionPersona])
+def get_all_solutions() -> list[SolutionPersona]:
+    """List all solution personas (Employees, Facilities, Executives)."""
+    return solutions_service.list_personas()
+ 
+ 
+@router.get("/{persona_key}", response_model=SolutionPersona)
+def get_solution(persona_key: PersonaKey) -> SolutionPersona:
+    """Get details for a single solution persona."""
+    try:
+        return solutions_service.get_persona(persona_key)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Persona not found")
+ 
+app/routers/resources.py
+HTTP routes for the Resources section.
+"""Routes for the 'Featured Resources' section."""
+from fastapi import APIRouter, Depends, HTTPException
+ 
+from app.llm.client import LLMUnavailableError, OpenAIClient, get_llm_client
+from app.models.schemas import Resource, ResourceSummaryResponse
+from app.services import resources_service
+ 
+router = APIRouter(prefix="/resources", tags=["Resources"])
+ 
+ 
+@router.get("", response_model=list[Resource])
+def get_featured_resources() -> list[Resource]:
+    """List the featured webinars/e-books shown on the page."""
+    return resources_service.list_resources()
+ 
+ 
+@router.get("/{title}/ai-teaser", response_model=ResourceSummaryResponse)
+def get_resource_ai_teaser(
+    title: str, llm: OpenAIClient = Depends(get_llm_client)
+) -> ResourceSummaryResponse:
+    """Generate a short LLM-written teaser line for a given resource."""
+    resource = resources_service.find_resource(title)
+    if resource is None:
+        raise HTTPException(status_code=404, detail="Resource not found")
+ 
+    try:
+        return resources_service.generate_ai_teaser(resource, llm)
+    except LLMUnavailableError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM generation failed: {exc}")
+ 
+app/routers/calculator.py
+HTTP routes for the Hybrid Workplace Planning Calculator.
+"""Routes for the 'Hybrid Workplace Planning Calculator' section."""
+from fastapi import APIRouter, Depends, HTTPException
+ 
+from app.llm.client import LLMUnavailableError, OpenAIClient, get_llm_client
+from app.models.schemas import CalculatorInput, CalculatorResult
+from app.services import calculator_service
+ 
+router = APIRouter(prefix="/calculator", tags=["Hybrid Workplace Calculator"])
+ 
+ 
+@router.post("/estimate", response_model=CalculatorResult)
+def estimate(payload: CalculatorInput) -> CalculatorResult:
+    """Compute recommended desk count, square footage, and cost savings only."""
+    return calculator_service.estimate(payload)
+ 
+ 
+@router.post("/estimate-with-insights", response_model=CalculatorResult)
+def estimate_with_insights(
+    payload: CalculatorInput, llm: OpenAIClient = Depends(get_llm_client)
+) -> CalculatorResult:
+    """Compute the estimate and attach an LLM-generated executive narrative."""
+    try:
+        return calculator_service.estimate_with_narrative(payload, llm)
+    except LLMUnavailableError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM generation failed: {exc}")
+ 
+app/routers/leads.py
+HTTP routes for lead submission.
+"""Routes for the 'Get started today' / demo request form."""
+from fastapi import APIRouter, Depends, HTTPException
+ 
+from app.llm.client import LLMUnavailableError, OpenAIClient, get_llm_client
+from app.models.schemas import LeadRequest, LeadResponse
+from app.services import leads_service
+ 
+router = APIRouter(prefix="/leads", tags=["Leads"])
+ 
+ 
+@router.post("", response_model=LeadResponse, status_code=201)
+def submit_lead(
+    payload: LeadRequest, llm: OpenAIClient = Depends(get_llm_client)
+) -> LeadResponse:
+    """Submit a 'Schedule a Demo' / 'Get Started' lead and get an AI-drafted follow-up."""
+    try:
+        return leads_service.create_lead(payload, llm)
+    except LLMUnavailableError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM generation failed: {exc}")
+ 
+ 
+@router.get("/{lead_id}", response_model=LeadRequest)
+def get_lead(lead_id: str) -> LeadRequest:
+    """Fetch a previously submitted lead by id."""
+    lead = leads_service.get_lead(lead_id)
+    if lead is None:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return lead
+ 
+app/routers/recommender.py
+HTTP routes for the LLM recommender.
+"""Routes for the LLM-powered 'which solution fits your role' recommender."""
+from fastapi import APIRouter, Depends
+ 
+from app.llm.client import OpenAIClient, get_llm_client
+from app.models.schemas import RecommendationRequest, RecommendationResponse
+from app.services import recommender_service
+ 
+router = APIRouter(prefix="/recommend", tags=["Recommender"])
+ 
+ 
+@router.post("", response_model=RecommendationResponse)
+def recommend(
+    payload: RecommendationRequest, llm: OpenAIClient = Depends(get_llm_client)
+) -> RecommendationResponse:
+    """
+    Given a free-text description of a visitor's role and challenges,
+    recommend the best-fit solution persona (Employees, Facilities, or
+    Executives) using the LLM, with a deterministic keyword fallback.
+    """
+    return recommender_service.recommend_persona_safe(payload, llm)
+ 
+app/main.py
+FastAPI application entrypoint — registers all routers.
+
+import logging
+ 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+ 
+from app.routers import calculator, leads, recommender, resources, solutions
+ 
+logging.basicConfig(level=logging.INFO)
+ 
+app = FastAPI(
+    title="FM:Systems Solutions API",
+    description="Backend services modeling the FM:Systems Solutions page, with OpenAI-powered insights.",
+    version="1.0.0",
+)
+ 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten to specific origins in production
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+ 
+app.include_router(solutions.router)
+app.include_router(resources.router)
+app.include_router(calculator.router)
+app.include_router(leads.router)
+app.include_router(recommender.router)
+ 
+ 
+@app.get("/health", tags=["Health"])
+def health_check() -> dict[str, str]:
+    """Simple liveness probe."""
+    return {"status": "ok"}
+
