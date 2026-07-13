@@ -1,0 +1,237 @@
+import os
+import time
+import pytest
+import requests
+from selenium import webdriver
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.edge.service import Service as EdgeService
+from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.firefox import GeckoDriverManager
+from webdriver_manager.microsoft import EdgeChromiumDriverManager
+
+# --------------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------------
+URL = "https://fmsystems.com/solutions/"
+HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
+SCREENSHOT_DIR = "screenshots"
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+VIEWPORTS = {
+    "desktop": (1920, 1080),
+    "laptop": (1366, 768),
+    "tablet": (768, 1024),
+    "mobile": (375, 812), # iPhone X-ish
+}
+
+BROWSERS = ["chrome", "firefox", "edge"]
+
+
+# --------------------------------------------------------------------------
+# DRIVER FACTORY
+# --------------------------------------------------------------------------
+def make_driver(browser_name: str):
+    if browser_name == "chrome":
+        options = webdriver.ChromeOptions()
+        if HEADLESS:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        service = ChromeService(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=options)
+
+    if browser_name == "firefox":
+        options = webdriver.FirefoxOptions()
+        if HEADLESS:
+            options.add_argument("-headless")
+        options.add_argument("--width=1920")
+        options.add_argument("--height=1080")
+        service = FirefoxService(GeckoDriverManager().install())
+        return webdriver.Firefox(service=service, options=options)
+
+    if browser_name == "edge":
+        options = webdriver.EdgeOptions()
+        if HEADLESS:
+            options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
+        service = EdgeService(EdgeChromiumDriverManager().install())
+        return webdriver.Edge(service=service, options=options)
+
+    raise ValueError(f"Unsupported browser: {browser_name}")
+
+
+# --------------------------------------------------------------------------
+# FIXTURE: parametrized across browsers
+# --------------------------------------------------------------------------
+@pytest.fixture(params=BROWSERS)
+def driver(request):
+    browser_name = request.param
+    try:
+        drv = make_driver(browser_name)
+    except Exception as exc:
+        pytest.skip(f"Could not start {browser_name} driver: {exc}")
+        return
+    drv.browser_name = browser_name
+    drv.implicitly_wait(5)
+    yield drv
+    drv.quit()
+
+
+# --------------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------------
+def load_page(driver, wait_selector=("tag name", "body"), timeout=15):
+    start = time.time()
+    driver.get(URL)
+    WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located(
+            (By.TAG_NAME, wait_selector[1]) if wait_selector[0] == "tag name"
+            else wait_selector
+        )
+    )
+    return time.time() - start
+
+
+def get_console_errors(driver):
+    """Only supported on Chromium-based browsers (Chrome/Edge)."""
+    try:
+        logs = driver.get_log("browser")
+        return [l for l in logs if l.get("level") == "SEVERE"]
+    except Exception:
+        return [] # Firefox doesn't support this log type via Selenium
+
+
+def save_screenshot(driver, name):
+    path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
+    driver.save_screenshot(path)
+    return path
+
+
+# --------------------------------------------------------------------------
+# TESTS
+# --------------------------------------------------------------------------
+class TestPageLoad:
+    def test_page_loads_successfully(self, driver):
+        load_time = load_page(driver)
+        assert driver.title, "Page title is empty"
+        assert load_time < 10, f"Page took too long to load: {load_time:.2f}s"
+        print(f"[{driver.browser_name}] Loaded in {load_time:.2f}s | Title: {driver.title!r}")
+
+    def test_http_status_ok(self):
+        resp = requests.get(URL, timeout=15, allow_redirects=True)
+        assert resp.status_code == 200, f"Page returned status {resp.status_code}"
+
+    def test_no_severe_console_errors(self, driver):
+        load_page(driver)
+        errors = get_console_errors(driver)
+        assert not errors, f"[{driver.browser_name}] Console errors found: {errors}"
+
+
+class TestCoreUIElements:
+    def test_header_and_nav_present(self, driver):
+        load_page(driver)
+        header = driver.find_elements(By.CSS_SELECTOR, "header, [role='banner'], nav")
+        assert header, f"[{driver.browser_name}] No header/nav element found"
+        assert any(el.is_displayed() for el in header), "Header/nav not visible"
+
+    def test_footer_present(self, driver):
+        load_page(driver)
+        footer = driver.find_elements(By.CSS_SELECTOR, "footer, [role='contentinfo']")
+        assert footer, f"[{driver.browser_name}] No footer element found"
+
+    def test_main_heading_present(self, driver):
+        load_page(driver)
+        headings = driver.find_elements(By.CSS_SELECTOR, "h1, h2")
+        visible_headings = [h.text.strip() for h in headings if h.is_displayed() and h.text.strip()]
+        assert visible_headings, f"[{driver.browser_name}] No visible heading text found"
+        print(f"[{driver.browser_name}] First heading: {visible_headings[0]!r}")
+
+    def test_cta_buttons_or_links_present(self, driver):
+        load_page(driver)
+        ctas = driver.find_elements(
+            By.CSS_SELECTOR, "a.button, a.btn, button, [class*='cta']"
+        )
+        assert ctas, f"[{driver.browser_name}] No CTA buttons/links found on page"
+
+
+class TestNavigationAndLinks:
+    def test_nav_links_are_clickable(self, driver):
+        load_page(driver)
+        nav_links = driver.find_elements(By.CSS_SELECTOR, "nav a[href]")
+        assert nav_links, f"[{driver.browser_name}] No nav links found"
+        broken = []
+        for link in nav_links[:8]: # cap to keep runtime reasonable
+            href = link.get_attribute("href")
+            if not href or href.startswith("mailto:") or href.startswith("tel:"):
+                continue
+            try:
+                r = requests.head(href, timeout=10, allow_redirects=True)
+                if r.status_code >= 400:
+                    broken.append((href, r.status_code))
+            except requests.RequestException as exc:
+                broken.append((href, str(exc)))
+        assert not broken, f"[{driver.browser_name}] Broken nav links: {broken}"
+
+    def test_all_page_links_status(self, driver):
+        load_page(driver)
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+        hrefs = {
+            l.get_attribute("href")
+            for l in links
+            if l.get_attribute("href")
+            and l.get_attribute("href").startswith("http")
+        }
+        broken = []
+        for href in list(hrefs)[:25]: # cap for runtime
+            try:
+                r = requests.head(href, timeout=10, allow_redirects=True)
+                if r.status_code >= 400:
+                    # retry with GET in case server disallows HEAD
+                    r = requests.get(href, timeout=10, allow_redirects=True)
+                if r.status_code >= 400:
+                    broken.append((href, r.status_code))
+            except requests.RequestException as exc:
+                broken.append((href, str(exc)))
+        assert not broken, f"[{driver.browser_name}] Broken links found: {broken}"
+
+
+class TestResponsiveDesign:
+    @pytest.mark.parametrize("viewport_name", VIEWPORTS.keys())
+    def test_no_horizontal_overflow(self, driver, viewport_name):
+        width, height = VIEWPORTS[viewport_name]
+        driver.set_window_size(width, height)
+        load_page(driver)
+        scroll_width = driver.execute_script("return document.documentElement.scrollWidth")
+        client_width = driver.execute_script("return document.documentElement.clientWidth")
+        save_screenshot(driver, f"{driver.browser_name}_{viewport_name}")
+        assert scroll_width <= client_width + 5, (
+            f"[{driver.browser_name}/{viewport_name}] Horizontal overflow: "
+            f"scrollWidth={scroll_width} > clientWidth={client_width}"
+        )
+
+    @pytest.mark.parametrize("viewport_name", ["mobile"])
+    def test_mobile_nav_accessible(self, driver, viewport_name):
+        width, height = VIEWPORTS[viewport_name]
+        driver.set_window_size(width, height)
+        load_page(driver)
+        # Look for a common hamburger/menu toggle pattern
+        toggles = driver.find_elements(
+            By.CSS_SELECTOR,
+            "[class*='menu-toggle'], [class*='hamburger'], [aria-label*='menu' i], button[class*='nav']",
+        )
+        nav = driver.find_elements(By.CSS_SELECTOR, "nav")
+        assert toggles or nav, f"[{driver.browser_name}] No mobile nav or toggle found"
+
+
+class TestVisualRegressionCapture:
+    def test_capture_full_page_screenshot(self, driver):
+        load_page(driver)
+        path = save_screenshot(driver, f"{driver.browser_name}_full_page")
+        assert os.path.exists(path)
+        print(f"[{driver.browser_name}] Screenshot saved: {path}")
